@@ -1,0 +1,112 @@
+   Setup (For Non-Coders)
+
+    Step 1: Install Python
+
+1. Go to https://python.org/downloads
+2. Download and run the installer
+3. **IMPORTANT: Check the box that says "Add Python to PATH"**
+4. Click Install
+
+    Step 2: Open Command Prompt
+
+**Windows:**
+- Press the Windows key
+- Type `cmd`
+- Hit Enter
+
+**Mac:**
+- Press Cmd + Space
+- Type `terminal`
+- Hit Enter
+
+    Step 3: Install Required Packages
+
+Copy and paste this line into the command prompt and hit Enter:
+
+```
+pip install yfinance pandas numpy scipy
+```
+
+Wait for it to finish (takes about a minute).
+
+    Step 4: Download the Script
+
+Save the `dealer_liquidity_monitor.py` file to your Downloads folder.
+
+    Step 5: Run It
+
+In the command prompt, type these two lines (hit Enter after each):
+
+```
+cd Downloads
+python dealer_liquidity_monitor.py
+```
+
+    Step 6: Use It
+
+You'll see a menu:
+- Type `1` to analyze a single stock
+- Type `3` for a quick scan of SPY, QQQ, IWM, AAPL, TSLA
+- Type `4` to exit
+
+When prompted, enter a stock symbol like `SPY` or `AAPL`.
+
+ 
+
+   What The Output Means
+
+    Liquidity Stress Score (0-100)
+- **0-50**: Balanced — dealers aren't particularly worried
+- **50-65**: Moderate — slight tilt toward downside fear
+- **65-100**: Elevated — dealers are charging more for downside protection
+
+    Delta-Matched Spread Asymmetry
+Compares put spreads vs call spreads at the same risk level:
+- **ATM**: At-the-money options (delta ~0.50)
+- **25d**: 25-delta options (typical hedge level)
+- **10d**: 10-delta options (tail/crash protection)
+
+Positive asymmetry = puts have wider spreads = downside fear.
+
+    Term Structure
+Shows how the asymmetry changes across expiration dates. Wider spreads at specific expiries usually means an event (earnings, Fed meeting).
+
+    Likely Pin Strikes
+Where price might "stick" on expiration Friday, based on open interest concentration.
+
+    Tail Stress
+Compares deep OTM puts (10-delta) to regular OTM puts (25-delta). If 10d puts have much wider spreads, dealers are really scared of a crash.
+
+ 
+
+   Limitations
+
+1. **Yahoo data is delayed** — not real-time, sometimes stale
+2. **Wide spreads can mean illiquidity** — not always fear
+3. **No actual dealer data** — we're inferring, not seeing their books
+4. **Works best on liquid names** — SPY, QQQ, AAPL are reliable; small caps are noisy
+5. **Snapshot, not predictive** — tells you what's happening now
+
+ 
+
+   One-Liner Explanation
+
+Compares put vs call bid-ask spreads at matched deltas, adjusted for liquidity, to measure downside stress using live Yahoo Finance data.
+
+ 
+
+   Troubleshooting
+
+**"python is not recognized"**
+- Reinstall Python and make sure to check "Add Python to PATH"
+
+**"No module named yfinance"**
+- Run `pip install yfinance pandas numpy scipy` again
+
+**"No options available"**
+- That stock doesn't have options, try SPY or AAPL
+
+**Colors look weird**
+- Windows command prompt sometimes doesn't show colors right. The data is still correct.
+
+Built for learning. Not financial advice.
