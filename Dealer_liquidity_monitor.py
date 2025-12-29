@@ -1,28 +1,21 @@
 """
-================================================================================
-DEALER LIQUIDITY ASYMMETRY MONITOR (v2)
-================================================================================
+DEALER LIQUIDITY ASYMMETRY MONITOR
+===================================
 
-Improved version that measures DOWNSIDE LIQUIDITY STRESS in options markets.
+What this does:
+    Market makers widen bid-ask spreads when they're nervous.
+    They widen puts MORE than calls if they're scared of a drop.
+    This tool detects that asymmetry using real options data.
 
-WHAT CHANGED FROM V1:
-1. Filters out junk (options < $0.10 mid, zero bids, no volume)
-2. Uses DELTA BUCKETS instead of strike distance (more stable)
-3. Controls for LIQUIDITY (volume, open interest) before inferring fear
-4. Gamma pinning now uses OPEN INTEREST concentration, not spreads
-5. Renamed metrics to be more accurate (liquidity asymmetry, not "fear")
+The trick:
+    You can't just compare raw spreads — illiquid options always look "scared."
+    So we compare puts vs calls at the SAME delta, and adjust for volume/OI.
+    What's left over is the real signal.
 
-THE CORE IDEA:
-Compare matched put/call spreads at same |delta|. If puts have wider 
-spreads AFTER controlling for liquidity, that's genuine downside stress.
-
-INSTALL:
+To run:
     pip install yfinance pandas numpy scipy
-
-RUN:
     python dealer_liquidity_monitor.py
 
-================================================================================
 """
 
 import yfinance as yf
@@ -34,27 +27,32 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-# === TERMINAL COLORS ===
+# --- Terminal colors (makes output pretty) ---
 class C:
-    R = '\033[91m'
-    G = '\033[92m'
-    Y = '\033[93m'
-    B = '\033[94m'
-    M = '\033[95m'
-    C = '\033[96m'
-    W = '\033[97m'
+    R = '\033[91m'      # red
+    G = '\033[92m'      # green
+    Y = '\033[93m'      # yellow
+    B = '\033[94m'      # blue
+    M = '\033[95m'      # magenta
+    C = '\033[96m'      # cyan
+    W = '\033[97m'      # white
     BOLD = '\033[1m'
     END = '\033[0m'
 
 
 def col(text, c):
+    """Wrap text in color codes"""
     return f"{c}{text}{C.END}"
 
 
-# === BLACK-SCHOLES FOR DELTA CALCULATION ===
+# --- Black-Scholes math (need this to calculate delta) ---
 
 def bs_delta(S, K, T, r, sigma, option_type='call'):
-    """Calculate Black-Scholes delta"""
+    """
+    How much does the option move when the stock moves $1?
+    Delta ranges from 0 to 1 for calls, 0 to -1 for puts.
+    ATM options have delta around 0.5 (or -0.5 for puts).
+    """
     if T <= 0 or sigma <= 0:
         return 0.5 if option_type == 'call' else -0.5
     
@@ -66,29 +64,8 @@ def bs_delta(S, K, T, r, sigma, option_type='call'):
         return norm.cdf(d1) - 1
 
 
-def estimate_iv(mid, S, K, T, r, option_type='call'):
-    """Simple IV estimation via bisection"""
-    if mid <= 0 or T <= 0:
-        return 0.3
-    
-    low, high = 0.01, 3.0
-    
-    for _ in range(50):
-        sigma = (low + high) / 2
-        price = bs_price(S, K, T, r, sigma, option_type)
-        
-        if abs(price - mid) < 0.001:
-            return sigma
-        elif price > mid:
-            high = sigma
-        else:
-            low = sigma
-    
-    return sigma
-
-
 def bs_price(S, K, T, r, sigma, option_type='call'):
-    """Black-Scholes price"""
+    """Standard Black-Scholes pricing formula"""
     if T <= 0:
         if option_type == 'call':
             return max(0, S - K)
@@ -104,10 +81,13 @@ def bs_price(S, K, T, r, sigma, option_type='call'):
         return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
 
-# === DATA FETCHING ===
+# --- Fetching and cleaning data ---
 
 def fetch_and_clean(symbol):
-    """Fetch option chain and apply quality filters"""
+    """
+    Grab the option chain from Yahoo Finance and clean it up.
+    We filter out garbage: penny options, zero bids, no volume, etc.
+    """
     print(f"\n{col('Fetching ' + symbol + '...', C.C)}")
     
     try:
@@ -124,7 +104,8 @@ def fetch_and_clean(symbol):
         
         all_data = []
         
-        for exp_date in expirations[:6]:  # First 6 expiries
+        # Grab first 6 expiries (don't need more for this)
+        for exp_date in expirations[:6]:
             try:
                 chain = ticker.option_chain(exp_date)
                 
@@ -150,34 +131,34 @@ def fetch_and_clean(symbol):
         
         df = pd.concat(all_data, ignore_index=True)
         
-        # === QUALITY FILTERS ===
+        # --- Filter out the junk ---
         original_len = len(df)
         
-        # 1. Must have valid bid/ask
+        # Need real bid/ask
         df = df[(df['bid'] > 0) & (df['ask'] > 0)]
         
-        # 2. Mid price must be >= $0.10 (filter penny options noise)
+        # No penny options (super noisy)
         df['mid'] = (df['bid'] + df['ask']) / 2
         df = df[df['mid'] >= 0.10]
         
-        # 3. Must have some volume OR open interest
+        # Need SOME activity
         df = df[(df['volume'] > 0) | (df['openInterest'] > 10)]
         
-        # 4. Spread must be reasonable (< 100% of mid)
+        # Spread can't be insane
         df['spread'] = df['ask'] - df['bid']
         df['spread_pct'] = df['spread'] / df['mid'] * 100
         df = df[df['spread_pct'] < 100]
         
         print(f"  Filtered: {original_len} → {len(df)} options")
         
-        # === CALCULATE DELTA ===
-        r = 0.05  # risk-free rate assumption
+        # --- Calculate delta for each option ---
+        r = 0.05  # just assume 5% rate, close enough
         
         deltas = []
         for _, row in df.iterrows():
             iv = row.get('impliedVolatility', 0.3)
             if pd.isna(iv) or iv <= 0:
-                iv = 0.3
+                iv = 0.3  # fallback
             
             delta = bs_delta(spot, row['strike'], row['T'], r, iv, row['type'])
             deltas.append(delta)
@@ -185,23 +166,23 @@ def fetch_and_clean(symbol):
         df['delta'] = deltas
         df['abs_delta'] = df['delta'].abs()
         
-        # === DELTA BUCKETS ===
-        # Group into: ATM (0.4-0.6), 25d (0.2-0.4), 10d (0.05-0.2), Wings (<0.05)
+        # --- Group into delta buckets ---
+        # This is key: we compare 25-delta puts to 25-delta calls, not by strike
         def delta_bucket(d):
             d = abs(d)
             if d >= 0.4:
-                return 'ATM'
+                return 'ATM'      # at-the-money
             elif d >= 0.2:
-                return '25d'
+                return '25d'      # 25 delta (typical hedge level)
             elif d >= 0.05:
-                return '10d'
+                return '10d'      # 10 delta (tail options)
             else:
-                return 'wing'
+                return 'wing'     # super far OTM, ignore these
         
         df['delta_bucket'] = df['delta'].apply(delta_bucket)
         
-        # === LIQUIDITY SCORE ===
-        # Normalize volume and OI to create liquidity score
+        # --- Liquidity score ---
+        # More volume + OI = more liquid = should have tighter spreads
         df['volume'] = df['volume'].fillna(0)
         df['openInterest'] = df['openInterest'].fillna(0)
         
@@ -213,9 +194,8 @@ def fetch_and_clean(symbol):
             0.4 * (df['openInterest'] / oi_max).clip(0, 1)
         )
         
-        # === LIQUIDITY-ADJUSTED SPREAD ===
-        # Higher liquidity should mean tighter spreads
-        # If spread is wide despite high liquidity, that's meaningful
+        # --- Expected spread (what spread "should" be given liquidity) ---
+        # If actual spread is wider than expected, that's the signal
         df['expected_spread'] = 5 + 20 * (1 - df['liq_score']) + 10 * (1 - df['abs_delta'])
         df['spread_residual'] = df['spread_pct'] - df['expected_spread']
         
@@ -231,18 +211,20 @@ def fetch_and_clean(symbol):
         return None
 
 
-# === ANALYSIS ===
+# --- The actual analysis ---
 
 def analyze_liquidity_asymmetry(result):
-    """Core analysis: compare put vs call spreads at matched deltas"""
+    """
+    This is where the magic happens.
+    We compare put spreads vs call spreads at each delta bucket.
+    If puts are wider (after adjusting for liquidity), dealers are scared of downside.
+    """
     
     df = result['data']
     spot = result['spot']
     analysis = {}
     
-    # === 1. DELTA-MATCHED ASYMMETRY ===
-    # Compare puts vs calls at same |delta| bucket
-    
+    # --- Compare puts vs calls at each delta level ---
     asymmetry_by_bucket = []
     
     for bucket in ['ATM', '25d', '10d']:
@@ -252,11 +234,11 @@ def analyze_liquidity_asymmetry(result):
         puts = bucket_data[bucket_data['type'] == 'put']
         
         if len(calls) > 0 and len(puts) > 0:
-            # Use residual spreads (liquidity-adjusted)
+            # Use liquidity-adjusted spreads
             call_spread = calls['spread_residual'].median()
             put_spread = puts['spread_residual'].median()
             
-            # Raw spreads for reference
+            # Also track raw spreads for reference
             call_raw = calls['spread_pct'].median()
             put_raw = puts['spread_pct'].median()
             
@@ -272,9 +254,8 @@ def analyze_liquidity_asymmetry(result):
     
     analysis['delta_asymmetry'] = pd.DataFrame(asymmetry_by_bucket)
     
-    # === 2. OVERALL LIQUIDITY STRESS SCORE ===
-    # Weighted average of asymmetries (25d most important)
-    
+    # --- Overall stress score ---
+    # Weight 25d the most (that's where the action is)
     weights = {'ATM': 0.2, '25d': 0.5, '10d': 0.3}
     
     if len(analysis['delta_asymmetry']) > 0:
@@ -288,14 +269,12 @@ def analyze_liquidity_asymmetry(result):
         
         raw_score = weighted_asym / total_weight if total_weight > 0 else 0
         
-        # Scale to 0-100 (calibrated so typical range maps nicely)
+        # Scale to 0-100
         analysis['stress_score'] = min(100, max(0, 50 + raw_score * 3))
     else:
         analysis['stress_score'] = 50
     
-    # === 3. TERM STRUCTURE ===
-    # Asymmetry by expiry
-    
+    # --- Term structure (how does asymmetry change by expiry?) ---
     term_structure = []
     
     for exp in df['expiry'].unique():
@@ -325,9 +304,8 @@ def analyze_liquidity_asymmetry(result):
     
     analysis['term_structure'] = pd.DataFrame(term_structure).sort_values('days')
     
-    # === 4. GAMMA PINNING (OI-based, not spread-based) ===
-    # Find strikes with highest open interest near ATM
-    
+    # --- Gamma pinning (where will price "stick" on expiry?) ---
+    # Look at open interest concentration, not spreads
     nearest_exp = df[df['days'] == df['days'].min()]
     atm_range = nearest_exp[abs(nearest_exp['strike'] - spot) / spot < 0.10]
     
@@ -335,7 +313,6 @@ def analyze_liquidity_asymmetry(result):
         oi_by_strike = atm_range.groupby('strike')['openInterest'].sum().sort_values(ascending=False)
         top_oi_strikes = oi_by_strike.head(5)
         
-        # Calculate "magnet strength" - OI concentration
         total_oi = oi_by_strike.sum()
         
         pin_strikes = []
@@ -352,9 +329,9 @@ def analyze_liquidity_asymmetry(result):
     else:
         analysis['pin_strikes'] = pd.DataFrame()
     
-    # === 5. TAIL STRESS (10d put vs 25d put) ===
-    # If 10-delta puts have much wider spreads than 25-delta, tail fear is elevated
-    
+    # --- Tail stress (are deep OTM puts extra wide?) ---
+    # Compare 10-delta puts to 25-delta puts
+    # If 10d are much wider, dealers are really scared of a crash
     puts_25d = df[(df['type'] == 'put') & (df['delta_bucket'] == '25d')]
     puts_10d = df[(df['type'] == 'put') & (df['delta_bucket'] == '10d')]
     
@@ -374,10 +351,10 @@ def analyze_liquidity_asymmetry(result):
     return analysis
 
 
-# === OUTPUT ===
+# --- Print the results nicely ---
 
 def print_report(result, analysis):
-    """Print formatted report"""
+    """Format and print everything"""
     
     symbol = result['symbol']
     spot = result['spot']
@@ -388,7 +365,7 @@ def print_report(result, analysis):
     
     print(f"\n{col('SPOT PRICE:', C.C)} ${spot:.2f}")
     
-    # Stress Score
+    # Stress score with color coding
     score = analysis['stress_score']
     if score > 65:
         score_col = C.R
@@ -408,7 +385,7 @@ def print_report(result, analysis):
     gauge = "█" * filled + "░" * (gauge_len - filled)
     print(f"  [{gauge}]")
     
-    # Delta-Matched Asymmetry
+    # Delta-matched asymmetry table
     print(f"\n{col('DELTA-MATCHED SPREAD ASYMMETRY:', C.C)}")
     print(f"  {'Bucket':<8} {'Call Spd%':<12} {'Put Spd%':<12} {'Asymmetry':<12} {'Interpretation'}")
     print(f"  {'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*20}")
@@ -424,7 +401,7 @@ def print_report(result, analysis):
         
         print(f"  {row['bucket']:<8} {row['call_spread_raw']:<12.1f} {row['put_spread_raw']:<12.1f} {asym:<+12.1f} {interp}")
     
-    # Term Structure
+    # Term structure
     print(f"\n{col('TERM STRUCTURE:', C.C)}")
     print(f"  {'Expiry':<12} {'Days':<6} {'P/C Ratio':<10} {'OI':<12} {'Status'}")
     print(f"  {'-'*12} {'-'*6} {'-'*10} {'-'*12} {'-'*15}")
@@ -440,7 +417,7 @@ def print_report(result, analysis):
         
         print(f"  {row['expiry']:<12} {row['days']:<6.0f} {ratio:<10.2f} {row['total_oi']:<12,.0f} {status}")
     
-    # Gamma Pinning
+    # Pin strikes
     if len(analysis['pin_strikes']) > 0:
         print(f"\n{col('LIKELY PIN STRIKES (by Open Interest):', C.C)}")
         for _, row in analysis['pin_strikes'].head(3).iterrows():
@@ -448,7 +425,7 @@ def print_report(result, analysis):
             direction = "above" if row['strike'] > spot else "below"
             print(f"  ${row['strike']:.0f} — {row['concentration']:.1f}% of OI ({dist:.1f} {direction} spot)")
     
-    # Tail Stress
+    # Tail stress
     ts = analysis['tail_stress']
     print(f"\n{col('TAIL STRESS (10d vs 25d puts):', C.C)}")
     if ts.get('elevated'):
@@ -458,7 +435,7 @@ def print_report(result, analysis):
     else:
         print(f"  ✓ Normal: ratio = {ts.get('ratio', 1):.2f}x")
     
-    # Interpretation
+    # Bottom line interpretation
     print(f"\n{col('INTERPRETATION:', C.C)}")
     print("─" * 50)
     
@@ -478,7 +455,7 @@ def print_report(result, analysis):
 
 
 def compare_symbols(symbols):
-    """Compare multiple symbols"""
+    """Run analysis on multiple symbols and show side-by-side"""
     
     results = []
     
@@ -497,7 +474,7 @@ def compare_symbols(symbols):
             'avg_asymmetry': analysis['delta_asymmetry']['asymmetry'].mean() if len(analysis['delta_asymmetry']) > 0 else 0
         })
     
-    # Print comparison
+    # Print comparison table
     print("\n" + "=" * 70)
     print(col("  MULTI-SYMBOL COMPARISON", C.BOLD))
     print("=" * 70)
@@ -513,27 +490,27 @@ def compare_symbols(symbols):
     return results
 
 
-# === MAIN ===
+# --- Main menu ---
 
 def main():
     print(col("""
     ╔══════════════════════════════════════════════════════════════════╗
-    ║         DEALER LIQUIDITY ASYMMETRY MONITOR (v2)                 ║
-    ║         Delta-Matched • Liquidity-Adjusted • OI-Based Pinning   ║
+    ║         DEALER LIQUIDITY ASYMMETRY MONITOR                      ║
+    ║         Detects downside stress from options spread patterns     ║
     ╚══════════════════════════════════════════════════════════════════╝
     """, C.C))
     
     while True:
-        print("\nOptions:")
-        print("  1. Analyze single symbol")
-        print("  2. Compare multiple symbols")
-        print("  3. Quick scan (SPY, QQQ, IWM)")
+        print("\nWhat do you want to do?")
+        print("  1. Analyze a single stock")
+        print("  2. Compare multiple stocks")
+        print("  3. Quick scan (SPY, QQQ, IWM, AAPL, TSLA)")
         print("  4. Exit")
         
         choice = input("\nChoice (1-4): ").strip()
         
         if choice == '1':
-            symbol = input("Symbol (e.g., SPY): ").strip().upper() or 'SPY'
+            symbol = input("Enter symbol (e.g., SPY): ").strip().upper() or 'SPY'
             
             result = fetch_and_clean(symbol)
             if result is None:
@@ -543,7 +520,7 @@ def main():
             print_report(result, analysis)
         
         elif choice == '2':
-            symbols = input("Symbols (comma-separated): ").strip().upper()
+            symbols = input("Enter symbols separated by comma: ").strip().upper()
             symbols = [s.strip() for s in symbols.split(',')]
             compare_symbols(symbols)
         
@@ -551,7 +528,7 @@ def main():
             compare_symbols(['SPY', 'QQQ', 'IWM', 'AAPL', 'TSLA'])
         
         elif choice == '4':
-            print(col("\nGoodbye!", C.C))
+            print(col("\nLater!", C.C))
             break
 
 
